@@ -266,6 +266,267 @@ def theme_regime(prices: dict, china_checks: list, ai_checks: list, glp1_checks:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# CHART DATA & TECHNICAL INDICATORS
+# ═══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_chart_data(ticker: str) -> pd.DataFrame:
+    """Fetch ~6 months of daily OHLCV (extra lookback for indicators)."""
+    try:
+        raw = yf.download(ticker, period="6mo", interval="1d", auto_adjust=True, progress=False)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.droplevel(1)
+        df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def _bollinger(close: pd.Series, period: int = 20, std_dev: float = 2.0):
+    mid = close.rolling(period).mean()
+    sigma = close.rolling(period).std()
+    return mid + std_dev * sigma, mid, mid - std_dev * sigma
+
+
+def _ichimoku(high: pd.Series, low: pd.Series, close: pd.Series):
+    tenkan = (high.rolling(9).max()  + low.rolling(9).min())  / 2
+    kijun  = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    span_a = ((tenkan + kijun) / 2).shift(26)
+    span_b = ((high.rolling(52).max() + low.rolling(52).min()) / 2).shift(26)
+    chikou = close.shift(-26)
+    return tenkan, kijun, span_a, span_b, chikou
+
+
+def _psar(df: pd.DataFrame, af0: float = 0.02, af_step: float = 0.02, af_max: float = 0.2):
+    hi = df["High"].values
+    lo = df["Low"].values
+    n  = len(hi)
+    sar  = lo.copy()
+    bull = True
+    af   = af0
+    hp, lp = hi[0], lo[0]
+    for i in range(1, n):
+        p = sar[i - 1]
+        if bull:
+            sar[i] = p + af * (hp - p)
+            sar[i] = min(sar[i], lo[i - 1], lo[max(0, i - 2)])
+            if lo[i] < sar[i]:
+                bull, sar[i], lp, af = False, hp, lo[i], af0
+            else:
+                if hi[i] > hp:
+                    hp = hi[i]
+                    af = min(af + af_step, af_max)
+        else:
+            sar[i] = p + af * (lp - p)
+            sar[i] = max(sar[i], hi[i - 1], hi[max(0, i - 2)])
+            if hi[i] > sar[i]:
+                bull, sar[i], hp, af = True, lp, hi[i], af0
+            else:
+                if lo[i] < lp:
+                    lp = lo[i]
+                    af = min(af + af_step, af_max)
+    s  = pd.Series(sar, index=df.index)
+    cl = df["Close"]
+    return s.where(cl > s), s.where(cl <= s)
+
+
+def _adx(df: pd.DataFrame, period: int = 14):
+    hi, lo, cl = df["High"], df["Low"], df["Close"]
+    prev_cl = cl.shift(1)
+    tr = pd.concat([(hi - lo), (hi - prev_cl).abs(), (lo - prev_cl).abs()], axis=1).max(axis=1)
+    up   = hi - hi.shift(1)
+    down = lo.shift(1) - lo
+    dm_p = up.where((up > down) & (up > 0), 0.0)
+    dm_m = down.where((down > up) & (down > 0), 0.0)
+    alpha  = 1 / period
+    atr    = tr.ewm(alpha=alpha, adjust=False).mean()
+    sdm_p  = dm_p.ewm(alpha=alpha, adjust=False).mean()
+    sdm_m  = dm_m.ewm(alpha=alpha, adjust=False).mean()
+    di_p = 100 * sdm_p / atr
+    di_m = 100 * sdm_m / atr
+    dx   = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, float("nan"))
+    adx  = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx, di_p, di_m
+
+
+def _macd(close: pd.Series, fast: int = 3, slow: int = 6, signal: int = 7):
+    line = _ema(close, fast) - _ema(close, slow)
+    sig  = _ema(line, signal)
+    return line, sig, line - sig
+
+
+def _tsi(close: pd.Series, long: int = 7, short: int = 4, signal: int = 7):
+    pc  = close.diff()
+    ds  = _ema(_ema(pc,       long), short)
+    dsa = _ema(_ema(pc.abs(), long), short)
+    tsi = 100 * ds / dsa
+    return tsi, _ema(tsi, signal)
+
+
+def _cloud_fill_traces(dates, sa_arr, sb_arr):
+    import plotly.graph_objects as go
+    traces = []
+    n = len(dates)
+    if n == 0:
+        return traces
+
+    def valid_bull(i):
+        return not pd.isna(sa_arr[i]) and not pd.isna(sb_arr[i]) and sa_arr[i] >= sb_arr[i]
+
+    def valid_bear(i):
+        return not pd.isna(sa_arr[i]) and not pd.isna(sb_arr[i]) and sa_arr[i] < sb_arr[i]
+
+    def segments(check_fn):
+        segs, start = [], None
+        for i in range(n):
+            if check_fn(i) and start is None:
+                start = i
+            elif not check_fn(i) and start is not None:
+                segs.append((start, i - 1))
+                start = None
+        if start is not None:
+            segs.append((start, n - 1))
+        return segs
+
+    for s, e in segments(valid_bull):
+        d = list(dates[s : e + 1])
+        a = list(sa_arr[s : e + 1])
+        b = list(sb_arr[s : e + 1])
+        traces.append(go.Scatter(x=d + d[::-1], y=a + b[::-1], fill="toself",
+                                 fillcolor="rgba(0,180,0,0.18)", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip"))
+    for s, e in segments(valid_bear):
+        d = list(dates[s : e + 1])
+        a = list(sa_arr[s : e + 1])
+        b = list(sb_arr[s : e + 1])
+        traces.append(go.Scatter(x=d + d[::-1], y=b + a[::-1], fill="toself",
+                                 fillcolor="rgba(210,0,0,0.18)", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip"))
+    return traces
+
+
+def render_chart(ticker: str):
+    """3-month daily chart: BB(20,2) · Ichimoku · PSAR · ADX · MACD(3,6,7) · TSI(7,4,7)."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    with st.spinner(f"Loading chart for {ticker}…"):
+        df = fetch_chart_data(ticker)
+
+    if df.empty or len(df) < 60:
+        st.warning(f"Not enough data to render chart for {ticker}.")
+        return
+
+    cl, hi, lo = df["Close"], df["High"], df["Low"]
+    bb_up, bb_mid, bb_lo              = _bollinger(cl)
+    tenkan, kijun, span_a, span_b, chikou = _ichimoku(hi, lo, cl)
+    psar_bull, psar_bear              = _psar(df)
+    adx, di_p, di_m                   = _adx(df)
+    macd_l, macd_s, macd_h            = _macd(cl)
+    tsi_l, tsi_s                      = _tsi(cl)
+
+    D   = df.iloc[-65:]
+    idx = D.index
+
+    def _s(series):
+        return series.reindex(idx)
+
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True,
+        row_heights=[0.52, 0.16, 0.16, 0.16],
+        vertical_spacing=0.025,
+        subplot_titles=[
+            f"{ticker} — Daily · 3 months  |  BB(20,2)  ·  Ichimoku Cloud  ·  Parabolic SAR",
+            "ADX(14)  /  +DI  /  −DI", "MACD (3, 6, 7)", "TSI (7, 4, 7)",
+        ],
+    )
+
+    bu, bl = _s(bb_up).values, _s(bb_lo).values
+    valid = ~(pd.isna(bu) | pd.isna(bl))
+    if valid.any():
+        vd = list(idx[valid])
+        fig.add_trace(go.Scatter(x=vd + vd[::-1], y=list(bu[valid]) + list(bl[valid][::-1]),
+                                 fill="toself", fillcolor="rgba(255,165,0,0.06)",
+                                 line=dict(width=0), showlegend=False, hoverinfo="skip"), row=1, col=1)
+
+    for t in _cloud_fill_traces(idx, _s(span_a).values, _s(span_b).values):
+        fig.add_trace(t, row=1, col=1)
+
+    fig.add_trace(go.Candlestick(x=idx, open=D["Open"], high=D["High"], low=D["Low"], close=D["Close"],
+                                 name=ticker, increasing_line_color="#26a69a",
+                                 decreasing_line_color="#ef5350", showlegend=False), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=idx, y=_s(bb_up),  name="BB Upper",
+                             line=dict(color="rgba(255,165,0,0.75)", width=1, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(bb_mid), name="BB Mid",
+                             line=dict(color="rgba(255,165,0,0.45)", width=1, dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(bb_lo),  name="BB Lower",
+                             line=dict(color="rgba(255,165,0,0.75)", width=1, dash="dot")), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=idx, y=_s(tenkan), name="Tenkan",
+                             line=dict(color="rgba(0,210,210,0.9)",  width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(kijun),  name="Kijun",
+                             line=dict(color="rgba(230,80,80,0.9)",  width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(span_a), name="Span A",
+                             line=dict(color="rgba(0,180,0,0.55)",   width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(span_b), name="Span B",
+                             line=dict(color="rgba(210,0,0,0.55)",   width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(chikou), name="Chikou",
+                             line=dict(color="rgba(160,0,220,0.65)", width=1, dash="dot")), row=1, col=1)
+
+    pb  = _s(psar_bull).dropna()
+    pbe = _s(psar_bear).dropna()
+    fig.add_trace(go.Scatter(x=pb.index,  y=pb.values,  mode="markers", name="PSAR Bull",
+                             marker=dict(symbol="circle", size=4, color="rgba(0,210,110,0.85)")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pbe.index, y=pbe.values, mode="markers", name="PSAR Bear",
+                             marker=dict(symbol="circle", size=4, color="rgba(220,55,55,0.85)")), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=idx, y=_s(adx),  name="ADX",
+                             line=dict(color="#e0e0e0", width=1.6)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(di_p), name="+DI",
+                             line=dict(color="#26a69a", width=1.2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(di_m), name="−DI",
+                             line=dict(color="#ef5350", width=1.2)), row=2, col=1)
+    fig.add_hline(y=25, line=dict(color="rgba(200,200,200,0.3)", width=1, dash="dot"), row=2, col=1)
+
+    fig.add_trace(go.Scatter(x=idx, y=_s(macd_l), name="MACD",
+                             line=dict(color="#2196f3", width=1.5)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(macd_s), name="Signal",
+                             line=dict(color="#ff9800", width=1.2)), row=3, col=1)
+    hist_vals = _s(macd_h)
+    fig.add_trace(go.Bar(x=idx, y=hist_vals, name="Hist", showlegend=False,
+                         marker_color=["rgba(38,166,154,0.75)" if v >= 0 else "rgba(239,83,80,0.75)"
+                                       for v in hist_vals.fillna(0)]), row=3, col=1)
+    fig.add_hline(y=0, line=dict(color="rgba(200,200,200,0.25)", width=1), row=3, col=1)
+
+    fig.add_trace(go.Scatter(x=idx, y=_s(tsi_l), name="TSI",
+                             line=dict(color="#ce93d8", width=1.5)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=idx, y=_s(tsi_s), name="TSI Sig",
+                             line=dict(color="#ffcc02", width=1.2)), row=4, col=1)
+    fig.add_hline(y=0, line=dict(color="rgba(200,200,200,0.25)", width=1), row=4, col=1)
+
+    fig.update_layout(
+        height=880, paper_bgcolor="#1a1a2e", plot_bgcolor="#1a1a2e",
+        font=dict(color="#d0d0d0", size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                    bgcolor="rgba(0,0,0,0.35)", font=dict(size=10), itemsizing="constant"),
+        margin=dict(l=60, r=20, t=40, b=20),
+        xaxis_rangeslider_visible=False, hovermode="x unified", barmode="overlay",
+    )
+    grid = dict(gridcolor="rgba(80,80,80,0.3)", zerolinecolor="rgba(80,80,80,0.4)", showgrid=True)
+    for r in range(1, 5):
+        fig.update_xaxes(**grid, showticklabels=(r == 4), row=r, col=1)
+        fig.update_yaxes(**grid, row=r, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # CSS
 # ═══════════════════════════════════════════════════════════════════
 
@@ -456,6 +717,18 @@ def render_portfolio(data: dict, prices: dict):
             st.markdown(f"${info['usd']:,} · {pct:.0f}%")
             st.caption(" · ".join(info["tickers"]))
             st.caption(SELL_RULES.get(theme, ""))
+
+    # ── Stock Chart ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("##### Stock Chart")
+    st.caption("Daily · 3 months · BB(20,2) · Ichimoku Cloud · Parabolic SAR · ADX(14) · MACD(3,6,7) · TSI(7,4,7)")
+    chart_ticker = st.selectbox(
+        "Select ticker to chart",
+        TICKERS,
+        key="chart_ticker_select",
+        label_visibility="collapsed",
+    )
+    render_chart(chart_ticker)
 
 
 # ═══════════════════════════════════════════════════════════════════
