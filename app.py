@@ -270,17 +270,27 @@ def theme_regime(prices: dict, china_checks: list, ai_checks: list, glp1_checks:
 # ═══════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_chart_data(ticker: str) -> pd.DataFrame:
-    """Fetch ~6 months of daily OHLCV (extra lookback for indicators)."""
+def fetch_all_chart_data(tickers: tuple) -> dict:
+    """Batch-fetch 6 months of daily OHLCV for all tickers in one request."""
+    result = {}
     try:
-        raw = yf.download(ticker, period="6mo", interval="1d", auto_adjust=True, progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.droplevel(1)
-        df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        df.index = pd.to_datetime(df.index)
-        return df
+        raw = yf.download(list(tickers), period="6mo", interval="1d",
+                          auto_adjust=True, progress=False, threads=True)
+        if not isinstance(raw.columns, pd.MultiIndex):
+            return result
+        for ticker in tickers:
+            try:
+                df = pd.DataFrame({
+                    m: raw[m][ticker] for m in ["Open", "High", "Low", "Close", "Volume"]
+                }).dropna()
+                df.index = pd.to_datetime(df.index)
+                if len(df) >= 60:
+                    result[ticker] = df
+            except Exception:
+                pass
     except Exception:
-        return pd.DataFrame()
+        pass
+    return result
 
 
 def _ema(s: pd.Series, span: int) -> pd.Series:
@@ -410,13 +420,10 @@ def _cloud_fill_traces(dates, sa_arr, sb_arr):
     return traces
 
 
-def render_chart(ticker: str):
+def render_chart(ticker: str, df: pd.DataFrame):
     """3-month daily chart: BB(20,2) · Ichimoku · PSAR · ADX · MACD(3,6,7) · TSI(7,4,7)."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
-
-    with st.spinner(f"Loading chart for {ticker}…"):
-        df = fetch_chart_data(ticker)
 
     if df.empty or len(df) < 60:
         st.warning(f"Not enough data to render chart for {ticker}.")
@@ -728,7 +735,9 @@ def render_portfolio(data: dict, prices: dict):
         key="chart_ticker_select",
         label_visibility="collapsed",
     )
-    render_chart(chart_ticker)
+    with st.spinner("Loading chart data…"):
+        all_chart_data = fetch_all_chart_data(tuple(TICKERS))
+    render_chart(chart_ticker, all_chart_data.get(chart_ticker, pd.DataFrame()))
 
 
 # ═══════════════════════════════════════════════════════════════════
