@@ -925,6 +925,79 @@ def render_dashboard(data: dict, prices: dict):
     }
     st.dataframe(pd.DataFrame(sizing), use_container_width=True, hide_index=True)
 
+    st.divider()
+
+    # ── Buy Targets ────────────────────────────────────────────────
+    st.markdown("### 🎯 Buy Targets")
+    st.caption("Target price = entry × (1 + target gain). If not yet entered, shows upside if you buy now.")
+
+    buy_rows = []
+    for r in PORTFOLIO_DEF:
+        ticker, company, theme, tier, tgt_gain, stop_pct, trail_pct, alloc_usd, notes = r
+        pos   = data["positions"].get(ticker, {})
+        entry = pos.get("entry_price")
+        price = prices.get(ticker)
+
+        in_pos = entry is not None and float(entry) > 0
+
+        if in_pos and price:
+            entry_f      = float(entry)
+            sell_target  = entry_f * (1 + tgt_gain)
+            stop_price   = entry_f * (1 - stop_pct)
+            pct_to_target = (sell_target - price) / price * 100
+            pct_to_stop   = (price - stop_price) / price * 100
+        elif price:
+            entry_f      = None
+            sell_target  = price * (1 + tgt_gain)
+            stop_price   = price * (1 - stop_pct)
+            pct_to_target = tgt_gain * 100
+            pct_to_stop   = stop_pct * 100
+        else:
+            entry_f = sell_target = stop_price = pct_to_target = pct_to_stop = None
+
+        if in_pos:
+            icon, status = "🟢", "IN POSITION"
+        elif pct_to_target is not None and pct_to_target >= 30:
+            icon, status = "🔵", "BUY ZONE"
+        elif pct_to_target is not None:
+            icon, status = "⚪", "WATCH"
+        else:
+            icon, status = "⚫", "No price"
+
+        buy_rows.append({
+            "":            icon,
+            "Ticker":      ticker,
+            "Theme":       theme,
+            "Price":       price,
+            "Entry":       entry_f,
+            "Target Price": sell_target,
+            "% to Target": pct_to_target,
+            "Stop Price":  stop_price,
+            "% to Stop":   pct_to_stop,
+            "Status":      status,
+        })
+
+    buy_rows.sort(key=lambda x: (
+        0 if x["Status"] == "IN POSITION" else (1 if x["Status"] == "BUY ZONE" else 2),
+        -(x["% to Target"] or 0),
+    ))
+
+    bt_df = pd.DataFrame(buy_rows)
+    st.dataframe(
+        bt_df,
+        column_config={
+            "":             st.column_config.TextColumn(width="small"),
+            "Price":        st.column_config.NumberColumn(format="$%.2f"),
+            "Entry":        st.column_config.NumberColumn(format="$%.2f"),
+            "Target Price": st.column_config.NumberColumn(format="$%.2f"),
+            "% to Target":  st.column_config.NumberColumn(format="%.1f%%", label="% to Target"),
+            "Stop Price":   st.column_config.NumberColumn(format="$%.2f"),
+            "% to Stop":    st.column_config.NumberColumn(format="%.1f%%", label="% above Stop"),
+        },
+        hide_index=True,
+        use_container_width=True,
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════
 # TAB: SETTINGS
