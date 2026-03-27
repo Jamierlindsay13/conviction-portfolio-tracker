@@ -751,6 +751,44 @@ def render_dashboard(data: dict, prices: dict):
 
     regimes = theme_regime(prices, china_checks, ai_checks, glp1_checks)
 
+    # ── Today's Signals ────────────────────────────────────────────
+    st.markdown("### 📋 Today's Signals")
+    sig_rows = []
+    for r in PORTFOLIO_DEF:
+        ticker, company, theme, tier, tgt_gain, stop_pct, trail_pct, alloc_usd, notes = r
+        pos     = data["positions"].get(ticker, {})
+        entry   = pos.get("entry_price")
+        highest = pos.get("highest_price")
+        price   = prices.get(ticker)
+
+        sig_text, sig_key = compute_signal(price, entry, highest, stop_pct, trail_pct, tgt_gain, tier)
+
+        if sig_key == "none" and price:
+            potential = tgt_gain * 100
+            sig_text = "🔵 BUY" if potential >= 30 else "⚪ WATCH"
+            sig_key  = "buy"  if potential >= 30 else "watch"
+
+        if entry and float(entry) > 0 and price:
+            tgt_price  = float(entry) * (1 + tgt_gain)
+            pct_to_tgt = (tgt_price - price) / price * 100
+            detail = f"${price:.2f}  →  target ${tgt_price:.2f}  ({pct_to_tgt:+.0f}%)"
+        elif price:
+            detail = f"${price:.2f}  (potential +{tgt_gain*100:.0f}% to target)"
+        else:
+            detail = "—"
+
+        sig_rows.append({"Ticker": ticker, "Theme": theme,
+                         "Signal": sig_text, "Detail": detail, "_k": sig_key})
+
+    _ord = {"sell": 0, "trim": 1, "buy": 2, "hold": 3, "watch": 4, "none": 5}
+    sig_rows.sort(key=lambda x: _ord.get(x["_k"], 5))
+    st.dataframe(
+        pd.DataFrame([{k: v for k, v in r.items() if k != "_k"} for r in sig_rows]),
+        hide_index=True, use_container_width=True,
+    )
+
+    st.divider()
+
     # ── Theme Regime Banners ────────────────────────────────────────
     st.markdown("### 🎯 Theme Regime Dashboard")
     c1, c2 = st.columns(2)
